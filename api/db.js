@@ -10,23 +10,45 @@ const CORS = {
   'Content-Type': 'application/json',
 };
 
+// Whitelist tabel yang boleh diakses — cegah akses ke tabel sistem
+const ALLOWED_TABLES = new Set([
+  'dk_users', 'dk_wallets', 'dk_trx', 'dk_budgets', 'dk_savings', 'dk_routines'
+]);
+
+const MAX_LIMIT = 500;
+const DEFAULT_LIMIT = 200;
+
+function escapeHtml(str) {
+  // Tidak dipakai di sini tapi tersedia kalau perlu
+  return String(str).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
 function parseQuery(query) {
   const where = [];
   const values = [];
   let order = null;
   let select = '*';
+  let limit = DEFAULT_LIMIT;
   let idx = 1;
 
   for (const [key, val] of Object.entries(query)) {
     if (key === 'order') {
-      const [col, dir] = val.split('.');
+      const dotIdx = val.indexOf('.');
+      const col = dotIdx !== -1 ? val.substring(0, dotIdx) : val;
+      const dir = dotIdx !== -1 ? val.substring(dotIdx + 1) : 'asc';
       const safeCol = col.replace(/[^a-z0-9_]/gi, '');
       const safeDir = dir === 'desc' ? 'DESC' : 'ASC';
-      order = `${safeCol} ${safeDir}`;
+      if (safeCol) order = `${safeCol} ${safeDir}`;
       continue;
     }
     if (key === 'select') {
-      select = val.split(',').map(c => c.trim().replace(/[^a-z0-9_*]/gi, '')).join(', ');
+      const cleaned = val.split(',').map(c => c.trim().replace(/[^a-z0-9_*]/gi, '')).filter(Boolean).join(', ');
+      if (cleaned) select = cleaned;
+      continue;
+    }
+    if (key === 'limit') {
+      const n = parseInt(val, 10);
+      if (!isNaN(n) && n > 0) limit = Math.min(n, MAX_LIMIT);
       continue;
     }
 
@@ -35,6 +57,7 @@ function parseQuery(query) {
     const op = val.substring(0, dotIdx);
     const operand = val.substring(dotIdx + 1);
     const safeKey = key.replace(/[^a-z0-9_]/gi, '');
+    if (!safeKey) continue;
 
     switch (op) {
       case 'eq':
@@ -71,7 +94,7 @@ function parseQuery(query) {
     }
   }
 
-  return { where, values, order, select };
+  return { where, values, order, select, limit };
 }
 
 export default async function handler(req, res) {
@@ -84,26 +107,31 @@ export default async function handler(req, res) {
   // Set CORS on all responses
   Object.entries(CORS).forEach(([k, v]) => res.setHeader(k, v));
 
-  // ── FIX: ambil table dari URL path, bukan query param ──
-  // URL: /api/db/rl_users?username=eq.alan
+  // Ambil nama tabel dari URL path: /api/db/dk_users → dk_users
   const urlPath = req.url.split('?')[0];
   const urlParts = urlPath.split('/').filter(Boolean);
   const table = urlParts[urlParts.length - 1];
 
+  // Validasi nama tabel
   if (!table || !/^[a-z][a-z0-9_]*$/.test(table)) {
     return res.status(400).json({ error: 'Invalid table name' });
   }
 
-  // Semua query params jadi filters (tidak perlu buang 'table')
+  // Whitelist check — cegah akses ke tabel sistem/tidak dikenal
+  if (!ALLOWED_TABLES.has(table)) {
+    return res.status(403).json({ error: 'Table not allowed' });
+  }
+
   const filters = req.query;
 
   try {
     // ── GET ───────────────────────────────────────────────
     if (req.method === 'GET') {
-      const { where, values, order, select } = parseQuery(filters);
+      const { where, values, order, select, limit } = parseQuery(filters);
       let q = `SELECT ${select} FROM ${table}`;
       if (where.length) q += ` WHERE ${where.join(' AND ')}`;
       if (order) q += ` ORDER BY ${order}`;
+      q += ` LIMIT ${limit}`;
       const rows = await sql(q, values);
       return res.status(200).json(rows);
     }
@@ -111,13 +139,20 @@ export default async function handler(req, res) {
     // ── POST ──────────────────────────────────────────────
     if (req.method === 'POST') {
       const body = req.body;
-      if (!body || typeof body !== 'object') {
-        return res.status(400).json({ error: 'Body required' });
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        return res.status(400).json({ error: 'Body must be a JSON object' });
       }
       const keys = Object.keys(body);
-      const cols = keys.map(k => k.replace(/[^a-z0-9_]/gi, '')).join(', ');
-      const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ');
-      const vals = keys.map(k => body[k]);
+      if (!keys.length) {
+        return res.status(400).json({ error: 'Body cannot be empty' });
+      }
+      const safeCols = keys.map(k => k.replace(/[^a-z0-9_]/gi, '')).filter(Boolean);
+      if (safeCols.length !== keys.length) {
+        return res.status(400).json({ error: 'Invalid column name in body' });
+      }
+      const cols = safeCols.join(', ');
+      const placeholders = safeCols.map((_, i) => `$${i + 1}`).join(', ');
+      const vals = keys.map(k => body[k] === undefined ? null : body[k]);
       const q = `INSERT INTO ${table} (${cols}) VALUES (${placeholders}) RETURNING *`;
       const rows = await sql(q, vals);
       return res.status(201).json(rows);
@@ -126,17 +161,24 @@ export default async function handler(req, res) {
     // ── PATCH ─────────────────────────────────────────────
     if (req.method === 'PATCH') {
       const body = req.body;
-      if (!body || typeof body !== 'object') {
-        return res.status(400).json({ error: 'Body required' });
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        return res.status(400).json({ error: 'Body must be a JSON object' });
+      }
+      const keys = Object.keys(body);
+      if (!keys.length) {
+        return res.status(400).json({ error: 'Body cannot be empty' });
       }
       const { where, values } = parseQuery(filters);
       if (!where.length) {
         return res.status(400).json({ error: 'PATCH requires at least one filter' });
       }
-      const keys = Object.keys(body);
       let idx = values.length + 1;
-      const sets = keys.map(k => `${k.replace(/[^a-z0-9_]/gi, '')} = $${idx++}`).join(', ');
-      const vals = [...values, ...keys.map(k => body[k])];
+      const safeCols = keys.map(k => k.replace(/[^a-z0-9_]/gi, '')).filter(Boolean);
+      if (safeCols.length !== keys.length) {
+        return res.status(400).json({ error: 'Invalid column name in body' });
+      }
+      const sets = safeCols.map(k => `${k} = $${idx++}`).join(', ');
+      const vals = [...values, ...keys.map(k => body[k] === undefined ? null : body[k])];
       const q = `UPDATE ${table} SET ${sets} WHERE ${where.join(' AND ')} RETURNING *`;
       const rows = await sql(q, vals);
       return res.status(200).json(rows);
@@ -144,12 +186,12 @@ export default async function handler(req, res) {
 
     // ── DELETE ────────────────────────────────────────────
     if (req.method === 'DELETE') {
-      const { where, values } = parseQuery(filters); // ← FIX: 'values' bukan 'vals'
+      const { where, values } = parseQuery(filters);
       if (!where.length) {
         return res.status(400).json({ error: 'DELETE requires at least one filter' });
       }
       const q = `DELETE FROM ${table} WHERE ${where.join(' AND ')} RETURNING *`;
-      const rows = await sql(q, values); // ← FIX: typo 'vals' → 'values'
+      const rows = await sql(q, values);
       return res.status(200).json(rows);
     }
 
