@@ -12,7 +12,10 @@ const CORS = {
 
 // Whitelist tabel yang boleh diakses — cegah akses ke tabel sistem
 const ALLOWED_TABLES = new Set([
-  'dk_users', 'dk_wallets', 'dk_trx', 'dk_budgets', 'dk_savings', 'dk_routines'
+  // Duitku
+  'dk_users', 'dk_wallets', 'dk_trx', 'dk_budgets', 'dk_savings', 'dk_routines',
+  // Brompit
+  'rl_users', 'rl_motors', 'rl_bbm', 'rl_fuel', 'rl_parts', 'rl_service'
 ]);
 
 const MAX_LIMIT = 500;
